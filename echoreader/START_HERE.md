@@ -4,7 +4,7 @@
 
 ## 1. Open the project
 
-1. Extract `EchoReader_Updated_Source.zip` (right-click it, then **Extract All**).
+1. Extract `EchoReader_Cloudflare_Setup.zip` (right-click it, then **Extract All**).
 2. Open VS Code -> File -> Open Folder -> choose the extracted **echoreader** folder that contains `package.json`.
 3. Make sure Node.js is installed (the existing project recommends Node.js 24).
 4. Double-click `INSTALL_AND_START_WINDOWS.bat` in that folder, or open the VS Code Terminal and run:
@@ -14,7 +14,7 @@
    npx expo start -c
    ```
 
-`npm install` is **required** before your first build: this update adds `expo-splash-screen@~58.0.14` to the project's dependency list, but its download and lockfile update could not be performed in this environment because access to the npm registry was unavailable. It must download the package and update `package-lock.json` on your computer. Keep the updated lockfile if you later push the project to GitHub (`npm ci` on GitHub Actions depends on it).
+Install dependencies before your first build. The project includes a lockfile for reproducible installs with `npm ci`.
 
 ## 2. Set up Firebase to make Sign in / Sign up work
 
@@ -31,14 +31,7 @@ For your GitHub Pages website, also set the matching values under GitHub reposit
 
 ## 3. Make ElevenLabs / Google narration work
 
-The client already connects to a **secure Firebase Functions** gateway in `functions/`. It does not contain a safe way to run provider keys on GitHub Pages. To activate cloud narration:
-
-1. Deploy and configure the existing Functions backend **only after reviewing Firebase/Firestore and provider billing**.
-2. Set the backend Secret Manager variable `TTS_PROVIDER_KEYS` with valid provider API keys; **never** use `EXPO_PUBLIC_` for a private voice-provider key.
-3. After deployment, put the public HTTPS **function endpoint** in `.env.local` as `EXPO_PUBLIC_TTS_PROXY_URL`, and in GitHub Actions repository Variables for your website. The endpoint must support `/status`, `/voices`, and `/tts`.
-4. Restart/rebuild the app. Voice availability is checked at runtime for signed-in users. A voice provider will remain disabled if the function or credential is unavailable.
-
-Read the original `README.md` for the backend's rate limits and provider deployment instructions. Cloud Functions/Firestore/Google TTS/ElevenLabs may cost money. The backend is **not deployed by this ZIP**.
+Follow [Cloudflare voice setup](cloudflare/README.md). The Worker uses your existing Firebase sign-in and can run on Cloudflare Workers Free. Add the provider credentials to Cloudflare, then set the deployed Worker URL in EchoReader.
 
 ## 4. See your splash screen
 
@@ -60,7 +53,7 @@ Read the original `README.md` for the backend's rate limits and provider deploym
 
 - **Passed**: TypeScript compile (`tsc --noEmit -p tsconfig.json`).
 - **Passed**: Firebase Functions Node.js unit tests, 11/11.
-- **Passed**: Expo web export for the modified app **with the new native splash plugin temporarily disabled**, because that package could not be downloaded in this environment. It is configured in the delivered source for when you install the package.
+- See [Cloudflare voice setup](cloudflare/README.md) for current Worker verification and deployment instructions.
 - **Not verified**: a standalone Android app, Firebase login with your real configuration, paid cloud voice synthesis, native splash display, or the automated browser interaction test (Playwright Chromium browser was unavailable here).
 
 To finish, install dependencies, configure Firebase, test on Android and web, then deploy when you are satisfied. **No external changes have been made.**

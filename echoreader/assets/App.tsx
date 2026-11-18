@@ -1,0 +1,1261 @@
+import React, { useState, useEffect, useRef, useMemo } from 'react';
+import {
+  StyleSheet, Text, View, ScrollView, TouchableOpacity, TouchableWithoutFeedback, TextInput, Modal,
+  Animated, Easing, Dimensions, StatusBar, FlatList, Image, Platform, LayoutChangeEvent,
+  ActivityIndicator,
+} from 'react-native';
+import { SafeAreaView } from 'react-native-safe-area-context';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as Speech from 'expo-speech';
+import { onAuthStateChanged, signOut, updateProfile, type User } from 'firebase/auth';
+
+import { C } from './src/Theme';
+import { Icon } from './src/Icon';
+import { cleanDocumentText, buildChunks, findNarrationStart } from './src/Text';
+import {
+  GOOGLE_VOICES, DEFAULT_ELEVEN_VOICE, CloudVoice, DeviceVoice, Keys, rankDeviceVoices, synthesize,
+  fetchTtsStatus, fetchElevenVoices, fetchGoogleVoices,
+  playbackRateFor, playUri, tierColor, langLabel, releaseAudioUri, prepareAudioPlayback,
+} from './src/Tts';
+import { BookResult } from './src/Books';
+import LibraryScreen, { ShelfItem } from './Libraryscreen';
+import AccountScreen from './AccountScreen';
+import AuthScreen from './AuthScreen';
+import StartupSplashScreen from './StartupSplashScreen';
+import { auth } from './src/FirebaseAuth';
+
+const { width } = Dimensions.get('window');
+
+const WAVE_BARS = 11;
+const WAVE_COLORS = [C.magenta, '#C34BFB', C.purple, '#6F78FA', C.blue, '#2BB6F2', C.cyan, '#2BB6F2', C.blue, C.purple, C.magenta];
+const SPEEDS = [0.8, 1.0, 1.25, 1.5, 2.0];
+const STARTUP_SPLASH_DURATION_MS = 9000;
+
+export default function App() {
+  const [user, setUser] = useState<User | null | undefined>(auth ? undefined : null);
+  const [startupSplashComplete, setStartupSplashComplete] = useState(false);
+  const [profileWarningFor, setProfileWarningFor] = useState<string>();
+  const [signOutError, setSignOutError] = useState('');
+  const [isSigningOut, setIsSigningOut] = useState(false);
+
+  useEffect(() => {
+    if (auth) return onAuthStateChanged(auth, setUser);
+  }, []);
+
+  useEffect(() => {
+    const timer = setTimeout(() => setStartupSplashComplete(true), STARTUP_SPLASH_DURATION_MS);
+    return () => clearTimeout(timer);
+  }, []);
+
+  const leaveReader = async () => {
+    if (!user || !auth) return;
+
+    setIsSigningOut(true);
+    setSignOutError('');
+    try {
+      await signOut(auth);
+      setProfileWarningFor(undefined);
+    } catch {
+      setSignOutError('Could not sign out. Try again.');
+    } finally {
+      setIsSigningOut(false);
+    }
+  };
+
+  if (user === undefined || !startupSplashComplete) {
+    return <StartupSplashScreen />;
+  }
+
+  if (!user) {
+    return <AuthScreen onProfileWarning={setProfileWarningFor} />;
+  }
+
+  return (
+    <Reader
+      key={`account:${user.uid}`}
+      account={user}
+      onExit={leaveReader}
+      isSigningOut={isSigningOut}
+      accountNotice={signOutError || (user && profileWarningFor === user.uid
+        ? 'Account created. Your display name could not be saved.'
+        : '')}
+    />
+  );
+}
+
+type ReaderProps = {
+  account: User;
+  onExit: () => void;
+  isSigningOut: boolean;
+  accountNotice: string;
+};
+
+function Reader({ account, onExit, isSigningOut, accountNotice }: ReaderProps) {
+  const defaultBook =
+    `Chapter 1: Sit back and let Echo read\n\n` +
+    `Welcome to EchoReader. Open the Library tab to borrow a classic book, then press play. ` +
+    `Notice how bracket citations [1] and footnotes [2, 3] are cleaned out automatically, so the narration flows uninterrupted.\n\n` +
+    `Tap the narrator button to choose a natural cloud voice, adjust the speed, or switch to Read-Along mode in the top right.`;
+
+  // --- content
+  const [title, setTitle] = useState('Sit back and let Echo read');
+  const [author, setAuthor] = useState('EchoReader Edition');
+  const [documentText, setDocumentText] = useState(cleanDocumentText(defaultBook));
+  const [shelf, setShelf] = useState<ShelfItem[]>([]);
+  const [profilePhotoUri, setProfilePhotoUri] = useState<string | null>(account?.photoURL || null);
+  const [accountName, setAccountName] = useState(account?.displayName || '');
+
+  // --- ui
+  const [screen, setScreen] = useState<'listen' | 'library' | 'account'>('listen');
+  const [viewMode, setViewMode] = useState<'player' | 'reader'>('player');
+  const [isVoiceModalOpen, setIsVoiceModalOpen] = useState(false);
+  const [voiceTab, setVoiceTab] = useState<'cloud' | 'device'>('device');
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [customInput, setCustomInput] = useState('');
+  const [trackWidth, setTrackWidth] = useState(1);
+  const [isExitConfirmOpen, setIsExitConfirmOpen] = useState(false);
+
+  const saveAccountName = async (name: string) => {
+    if (!account) throw new Error('You must be signed in to update your account name.');
+    try {
+      await updateProfile(account, { displayName: name });
+      setAccountName(name);
+    } catch {
+      throw new Error('Could not update your name. Check your connection and try again.');
+    }
+  };
+
+  // --- playback
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [speechRate, setSpeechRate] = useState(1.0);
+  useEffect(() => {
+    let alive = true;
+    AsyncStorage.getItem(`echoreader:${account.uid}:speed`).then((saved) => {
+      const value = Number(saved);
+      if (alive && saved !== null && SPEEDS.includes(value)) setSpeechRate(value);
+    }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [account.uid]);
+  const [chunkIndex, setChunkIndex] = useState(0);
+  const [wordRange, setWordRange] = useState({ start: 0, length: 0 });
+  const [listeningOffset, setListeningOffset] = useState(0);
+  const listeningOffsetRef = useRef(0);
+  const progressTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const [bookmarkOffset, setBookmarkOffset] = useState<number | null>(null);
+  const savedProgressKeyRef = useRef('');
+  const [error, setError] = useState<string | null>(null);
+
+  // --- voices
+  const [providerAvailability, setProviderAvailability] = useState<Keys>({ google: false, eleven: false });
+  const [cloudStatusLoading, setCloudStatusLoading] = useState(false);
+  const [cloudStatusError, setCloudStatusError] = useState('');
+  const [elevenVoiceError, setElevenVoiceError] = useState('');
+  const [googleVoiceError, setGoogleVoiceError] = useState('');
+  const [cloudTab, setCloudTab] = useState<'eleven' | 'google'>('eleven');
+  const [elevenVoices, setElevenVoices] = useState<CloudVoice[]>([]);
+  const [googleVoices, setGoogleVoices] = useState<CloudVoice[]>(GOOGLE_VOICES);
+  const [elevenLoading, setElevenLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [engine, setEngine] = useState<'cloud' | 'device'>('device');
+  const [cloudVoice, setCloudVoice] = useState<CloudVoice>(DEFAULT_ELEVEN_VOICE);
+  const [deviceVoices, setDeviceVoices] = useState<DeviceVoice[]>([]);
+  const [deviceVoice, setDeviceVoice] = useState<DeviceVoice | undefined>(undefined);
+  const [deviceVoicesLoading, setDeviceVoicesLoading] = useState(true);
+  const [deviceVoiceError, setDeviceVoiceError] = useState('');
+
+  const useCloud = engine === 'cloud' && providerAvailability[cloudVoice.provider];
+  const voiceName = useCloud ? cloudVoice.label : deviceVoice?.label || 'System voice';
+
+  const sessionRef = useRef(0);
+  const stopAudioRef = useRef<null | (() => void)>(null);
+  const cacheRef = useRef<Map<string, Promise<string>>>(new Map());
+  const clearAudioCache = () => {
+    cacheRef.current.forEach((uri) => { void uri.then(releaseAudioUri).catch(() => {}); });
+    cacheRef.current.clear();
+  };
+  const chunks = useMemo(() => buildChunks(documentText), [documentText]);
+  const firstChapterIndex = useMemo(() => {
+    const narrationStart = findNarrationStart(documentText);
+    if (narrationStart === null) return 0;
+    const index = chunks.findIndex((chunk) => chunk.end > narrationStart);
+    return index < 0 ? 0 : index;
+  }, [documentText, chunks]);
+  const bookIntroPendingRef = useRef(true);
+  // Save only position data, not the full imported book (which can exceed AsyncStorage limits).
+  const documentKey = useMemo(() => {
+    let hash = 2166136261;
+    for (let i = 0; i < documentText.length; i++) {
+      hash = Math.imul(hash ^ documentText.charCodeAt(i), 16777619);
+    }
+    return `echoreader:${account.uid}:${(hash >>> 0).toString(36)}:${documentText.length}`;
+  }, [account.uid, documentText]);
+
+  const updateListeningPosition = (position: number) => {
+    const clamped = Math.max(0, Math.min(documentText.length, Math.floor(position)));
+    listeningOffsetRef.current = clamped;
+    setListeningOffset(clamped);
+  };
+
+  useEffect(() => {
+    savedProgressKeyRef.current = '';
+    let alive = true;
+    Promise.all([
+      AsyncStorage.getItem(`${documentKey}:progress`),
+      AsyncStorage.getItem(`${documentKey}:bookmark`),
+    ]).then(([progress, bookmark]) => {
+      if (!alive) return;
+      const position = Number(progress);
+      const restored = progress !== null && Number.isFinite(position) && position > 0
+        ? Math.min(position, documentText.length) : 0;
+      updateListeningPosition(restored);
+      const nextIndex = chunks.findIndex((chunk) => chunk.end > restored);
+      setChunkIndex(nextIndex < 0 ? Math.max(0, chunks.length - 1) : nextIndex);
+      const savedBookmark = Number(bookmark);
+      setBookmarkOffset(bookmark !== null && Number.isFinite(savedBookmark) ? savedBookmark : null);
+      bookIntroPendingRef.current = restored === 0;
+      savedProgressKeyRef.current = documentKey;
+    }).catch(() => {
+      if (alive) savedProgressKeyRef.current = documentKey;
+    });
+    return () => { alive = false; };
+  }, [documentKey]);
+
+  useEffect(() => {
+    if (savedProgressKeyRef.current !== documentKey) return;
+    const timer = setTimeout(() => {
+      void AsyncStorage.setItem(`${documentKey}:progress`, String(listeningOffset)).catch(() => undefined);
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [documentKey, listeningOffset]);
+
+  const addBookmark = () => {
+    const position = listeningOffsetRef.current;
+    setBookmarkOffset(position);
+    void AsyncStorage.setItem(`${documentKey}:bookmark`, String(position)).catch(() => undefined);
+  };
+
+  const bars = useRef(Array.from({ length: WAVE_BARS }, () => new Animated.Value(8))).current;
+  const ringPulse = useRef(new Animated.Value(0)).current;
+
+  // load device voices
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        const ranked = rankDeviceVoices(await Speech.getAvailableVoicesAsync());
+        if (!active) return;
+        setDeviceVoices(ranked);
+        setDeviceVoice((current) => current && ranked.some((voice) => voice.identifier === current.identifier)
+          ? current
+          : ranked[0]);
+        setDeviceVoiceError(ranked.length ? '' : 'No selectable voices were returned. EchoReader can still try the system default voice.');
+      } catch (e) {
+        if (!active) return;
+        setDeviceVoices([]);
+        setDeviceVoice(undefined);
+        setDeviceVoiceError(e instanceof Error
+          ? `Could not load device voices: ${e.message}`
+          : 'Could not load device voices. EchoReader can still try the system default voice.');
+      } finally {
+        if (active) setDeviceVoicesLoading(false);
+      }
+    })();
+    return () => {
+      active = false;
+      stopAll();
+    };
+  }, []);
+
+  // Cloud state comes from the authenticated backend; device narration never depends on it.
+  useEffect(() => {
+    let active = true;
+    setCloudStatusLoading(true);
+    setCloudStatusError('');
+    fetchTtsStatus()
+      .then((providers) => {
+        if (!active) return;
+        setProviderAvailability(providers);
+        if (!providers.eleven && providers.google) setCloudTab('google');
+        if (!providers.eleven && !providers.google) {
+          setEngine('device');
+          setCloudStatusError('No cloud narrator is configured on the secure backend. Device voices are still available.');
+        }
+      })
+      .catch((e: unknown) => {
+        if (!active) return;
+        setProviderAvailability({ google: false, eleven: false });
+        setEngine('device');
+        setCloudStatusError(e instanceof Error
+          ? e.message
+          : 'The secure narration service could not be reached. Device voices are still available.');
+      })
+      .finally(() => { if (active) setCloudStatusLoading(false); });
+    return () => { active = false; };
+  }, [account.uid]);
+
+  useEffect(() => {
+    let active = true;
+    if (!providerAvailability.eleven) {
+      setElevenVoices([]);
+      setElevenLoading(false);
+      setElevenVoiceError('');
+      return () => { active = false; };
+    }
+    setElevenLoading(true);
+    setElevenVoiceError('');
+    fetchElevenVoices()
+      .then((voices) => {
+        if (!active) return;
+        setElevenVoices(voices);
+        if (voices.length === 0) setElevenVoiceError('No ElevenLabs voices are available for this account.');
+        setCloudVoice((current) => current.provider === 'eleven' && voices.some((voice) => voice.id === current.id)
+          ? current
+          : current.provider === 'eleven' && voices[0] ? voices[0] : current);
+      })
+      .catch((e: unknown) => {
+        if (active) setElevenVoiceError(e instanceof Error ? e.message : 'Could not load ElevenLabs voices.');
+      })
+      .finally(() => { if (active) setElevenLoading(false); });
+    return () => { active = false; };
+  }, [providerAvailability.eleven]);
+
+  useEffect(() => {
+    let active = true;
+    if (!providerAvailability.google) {
+      setGoogleVoices([]);
+      setGoogleLoading(false);
+      setGoogleVoiceError('');
+      return () => { active = false; };
+    }
+    setGoogleLoading(true);
+    setGoogleVoiceError('');
+    fetchGoogleVoices()
+      .then((voices) => {
+        if (!active) return;
+        setGoogleVoices(voices);
+        if (voices.length === 0) setGoogleVoiceError('No Google voices are currently available.');
+        setCloudVoice((current) => current.provider === 'google' && voices.some((voice) => voice.id === current.id)
+          ? current
+          : current.provider === 'google' && voices[0] ? voices[0] : current);
+      })
+      .catch((e: unknown) => {
+        if (active) setGoogleVoiceError(e instanceof Error ? e.message : 'Could not load Google voices.');
+      })
+      .finally(() => { if (active) setGoogleLoading(false); });
+    return () => { active = false; };
+  }, [providerAvailability.google]);
+
+  // new document -> reset
+  useEffect(() => () => clearAudioCache(), [documentText]);
+
+  // animations
+  useEffect(() => {
+    if (isPlaying) {
+      const loops = bars.map((anim, i) => {
+        const max = 20 + ((i * 7) % 5) * 9 + (i === 5 ? 14 : 0);
+        const dur = 300 + ((i * 53) % 5) * 70;
+        return Animated.loop(Animated.sequence([
+          Animated.timing(anim, { toValue: max, duration: dur, easing: Easing.inOut(Easing.quad), useNativeDriver: false }),
+          Animated.timing(anim, { toValue: 8, duration: dur, easing: Easing.inOut(Easing.quad), useNativeDriver: false }),
+        ]));
+      });
+      const ring = Animated.loop(Animated.sequence([
+        Animated.timing(ringPulse, { toValue: 1, duration: 1400, easing: Easing.out(Easing.quad), useNativeDriver: true }),
+        Animated.timing(ringPulse, { toValue: 0, duration: 0, useNativeDriver: true }),
+      ]));
+      loops.forEach((l) => l.start());
+      ring.start();
+      return () => { loops.forEach((l) => l.stop()); ring.stop(); };
+    }
+    bars.forEach((a, i) => a.setValue(6 + (i === 5 ? 4 : 0)));
+    ringPulse.setValue(0);
+  }, [isPlaying]);
+
+  // progress
+  const currentChunk = chunks[chunkIndex];
+  const currentOffset = listeningOffset;
+  const totalWords = documentText.split(/\s+/).filter(Boolean).length;
+  const totalMinutes = Math.max(1, Math.round(totalWords / (160 * speechRate)));
+  const progressPercent = Math.min(100, (currentOffset / Math.max(1, documentText.length)) * 100);
+  const elapsedMinutes = Math.floor((currentOffset / Math.max(1, documentText.length)) * totalMinutes);
+
+  // -------------------------------------------------------------------------
+  // PLAYBACK ENGINE
+  // -------------------------------------------------------------------------
+  const stopAll = () => {
+    if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
+    sessionRef.current += 1;
+    Speech.stop();
+    stopAudioRef.current?.();
+    stopAudioRef.current = null;
+  };
+
+  const playFrom = (
+    startIdx: number,
+    o: { rate?: number; cloudVoice?: CloudVoice; deviceVoice?: DeviceVoice; cloud?: boolean } = {},
+    requestedOffset = listeningOffsetRef.current,
+  ) => {
+    prepareAudioPlayback();
+    stopAll();
+    const session = sessionRef.current;
+    const rate = o.rate ?? speechRate;
+    const cv = o.cloudVoice ?? cloudVoice;
+    const dv = o.deviceVoice ?? deviceVoice;
+    const cloud = o.cloud ?? useCloud;
+    const playbackStartIdx = startIdx === 0 && requestedOffset === 0 ? firstChapterIndex : startIdx;
+    const startChunk = chunks[playbackStartIdx];
+    const startOffset = startChunk ? Math.min(startChunk.end, Math.max(startChunk.start, requestedOffset)) : 0;
+
+    setIsPlaying(true);
+    setError(null);
+    setWordRange({ start: 0, length: 0 });
+    updateListeningPosition(startOffset);
+
+    const synth = (i: number): Promise<string> => {
+      const c = chunks[i];
+      const key = `${cv.provider}|${cv.id}|${rate}|${i}`;
+      if (!cacheRef.current.has(key)) {
+          const p = synthesize(documentText.slice(c.start, c.end), cv, rate);
+        cacheRef.current.set(key, p);
+        p.catch(() => cacheRef.current.delete(key));
+      }
+      return cacheRef.current.get(key)!;
+    };
+
+    const run = async (idx: number) => {
+      if (session !== sessionRef.current) return;
+      if (idx >= chunks.length) {
+        setIsPlaying(false);
+        updateListeningPosition(documentText.length);
+        return;
+      }
+      if (idx === firstChapterIndex && bookIntroPendingRef.current && startOffset <= chunks[idx].start) {
+        bookIntroPendingRef.current = false;
+        setChunkIndex(idx);
+        const intro = `${title}, by ${author}.`;
+        if (cloud) {
+          setIsBuffering(true);
+          try {
+            const uri = await synthesize(intro, cv, rate);
+            if (session !== sessionRef.current) return;
+            setIsBuffering(false);
+            stopAudioRef.current = playUri(
+              uri,
+              () => { void run(idx); },
+              playbackRateFor(cv, rate),
+              (e) => {
+                if (session !== sessionRef.current) return;
+                setIsPlaying(false);
+                setError(e instanceof Error ? e.message : 'Could not play generated audio.');
+              }
+            );
+          } catch (e: any) {
+            if (session !== sessionRef.current) return;
+            setIsBuffering(false);
+            setIsPlaying(false);
+            setEngine('device');
+            setVoiceTab('device');
+            setError(`${e?.message || 'Could not generate speech.'} Switched to device narration. Press Play to continue.`);
+          }
+        } else {
+          try {
+            Speech.speak(intro, {
+              voice: dv?.identifier,
+              rate,
+              pitch: 1.0,
+              onDone: () => { void run(idx); },
+              onError: (speechError) => {
+                if (session !== sessionRef.current) return;
+                setIsPlaying(false);
+                setError(speechError.message || 'Device narration failed. Try another device voice.');
+              },
+            });
+          } catch (speechError) {
+            if (session === sessionRef.current) {
+              setIsPlaying(false);
+              setError(speechError instanceof Error ? speechError.message : 'Device narration is unavailable on this device.');
+            }
+          }
+        }
+        return;
+      }
+      const c = chunks[idx];
+      setChunkIndex(idx);
+      setWordRange({ start: 0, length: 0 });
+      const offsetInChunk = idx === playbackStartIdx ? startOffset : c.start;
+      updateListeningPosition(offsetInChunk);
+
+      if (cloud) {
+        setIsBuffering(true);
+        try {
+          const uri = await synth(idx);
+          if (session !== sessionRef.current) return;
+          setIsBuffering(false);
+          if (idx + 1 < chunks.length) synth(idx + 1).catch(() => {}); // prefetch next
+          stopAudioRef.current = playUri(
+            uri,
+            () => run(idx + 1),
+            playbackRateFor(cv, rate),
+            (e) => {
+              if (session !== sessionRef.current) return;
+              setIsPlaying(false);
+              setError(e instanceof Error ? e.message : 'Could not play generated audio.');
+            },
+            (seconds, duration) => {
+              if (session === sessionRef.current && duration > 0) {
+                updateListeningPosition(c.start + ((c.end - c.start) * seconds / duration));
+              }
+            },
+            (offsetInChunk - c.start) / Math.max(1, c.end - c.start),
+          );
+        } catch (e: any) {
+          if (session !== sessionRef.current) return;
+          setIsBuffering(false);
+          setIsPlaying(false);
+          setEngine('device');
+          setVoiceTab('device');
+          setError(`${e?.message || 'Could not generate speech.'} Switched to device narration. Press Play to continue.`);
+        }
+      } else {
+        try {
+          // Some Android/browser voices do not emit word boundaries. In that case,
+          // advance an explicitly estimated position between the actual boundaries.
+          let anchorPosition = offsetInChunk;
+          let anchorTime = Date.now();
+          const estimatedCharsPerSecond = 14 * rate;
+          if (progressTimerRef.current) clearInterval(progressTimerRef.current);
+          progressTimerRef.current = setInterval(() => {
+            if (session !== sessionRef.current) return;
+            const estimate = anchorPosition + (Date.now() - anchorTime) / 1000 * estimatedCharsPerSecond;
+            updateListeningPosition(Math.min(c.end - 1, Math.max(listeningOffsetRef.current, estimate)));
+          }, 200);
+          Speech.speak(documentText.slice(offsetInChunk, c.end), {
+            voice: dv?.identifier,
+            rate,
+            pitch: 1.0,
+            onBoundary: (ev: any) => {
+              if (session !== sessionRef.current) return;
+              if (typeof ev?.charIndex === 'number') {
+                const absolute = offsetInChunk + ev.charIndex;
+                anchorPosition = Math.max(listeningOffsetRef.current, absolute);
+                anchorTime = Date.now();
+                updateListeningPosition(anchorPosition);
+                setWordRange({ start: absolute, length: ev.charLength || 4 });
+              }
+            },
+            onDone: () => {
+              if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
+              updateListeningPosition(c.end);
+              void run(idx + 1);
+            },
+            onError: (speechError) => {
+              if (session !== sessionRef.current) return;
+              if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
+              setIsPlaying(false);
+              setError(speechError.message || 'Device narration failed. Try another device voice.');
+            },
+          });
+        } catch (speechError) {
+          if (session === sessionRef.current) {
+            if (progressTimerRef.current) { clearInterval(progressTimerRef.current); progressTimerRef.current = null; }
+            setIsPlaying(false);
+            setError(speechError instanceof Error ? speechError.message : 'Device narration is unavailable on this device.');
+          }
+        }
+      }
+    };
+    run(playbackStartIdx);
+  };
+
+  const pause = () => {
+    stopAll();
+    setIsPlaying(false);
+    setIsBuffering(false);
+    if (savedProgressKeyRef.current === documentKey) {
+      void AsyncStorage.setItem(`${documentKey}:progress`, String(listeningOffsetRef.current)).catch(() => undefined);
+    }
+  };
+
+  const togglePlayPause = () => {
+    if (isPlaying) return pause();
+    if (listeningOffsetRef.current >= documentText.length - 1) {
+      bookIntroPendingRef.current = true;
+      updateListeningPosition(0);
+      return playFrom(firstChapterIndex, {}, 0);
+    }
+    return playFrom(chunkIndex);
+  };
+
+  const chunkAt = (pos: number) => {
+    const i = chunks.findIndex((c) => c.end > pos);
+    return i === -1 ? Math.max(0, chunks.length - 1) : i;
+  };
+
+  const jumpToOffset = (offset: number) => {
+    const position = Math.max(0, Math.min(documentText.length - 1, Math.floor(offset)));
+    const idx = chunkAt(position);
+    setChunkIndex(idx);
+    updateListeningPosition(position);
+    setWordRange({ start: 0, length: 0 });
+    bookIntroPendingRef.current = false;
+    if (isPlaying) playFrom(idx, {}, position);
+  };
+
+  // Fifteen seconds is approximate for on-device TTS; cloud audio seeking uses
+  // the actual generated audio duration once the appropriate chunk is loaded.
+  const skipSeconds = (s: number) => {
+    const approxCharsPerSecond = (documentText.length / Math.max(1, totalMinutes * 60));
+    jumpToOffset(listeningOffsetRef.current + s * approxCharsPerSecond);
+  };
+
+  const seekToFraction = (f: number) => jumpToOffset(Math.max(0, Math.min(1, f)) * documentText.length);
+
+  const handleSpeedChange = (rate: number) => {
+    setSpeechRate(rate);
+    void AsyncStorage.setItem(`echoreader:${account.uid}:speed`, String(rate)).catch(() => undefined);
+    if (isPlaying) playFrom(chunkIndex, { rate });
+  };
+
+  // -------------------------------------------------------------------------
+  // VOICE SELECTION
+  // -------------------------------------------------------------------------
+  const audition = async (v: CloudVoice) => {
+    prepareAudioPlayback();
+    stopAll();
+    setError(null);
+    try {
+      const uri = await synthesize('Hello, I will be your narrator.', v, speechRate);
+      const session = sessionRef.current;
+      stopAudioRef.current = playUri(
+        uri,
+        () => {},
+        playbackRateFor(v, speechRate),
+        (e) => {
+          if (session === sessionRef.current) setError(e instanceof Error ? e.message : 'Could not play a sample.');
+        }
+      );
+    } catch (e: any) {
+      setEngine('device');
+      setVoiceTab('device');
+      setError(e?.message || 'Could not play a sample.');
+    }
+  };
+
+  const pickCloudVoice = (v: CloudVoice) => {
+    if (!providerAvailability[v.provider]) {
+      setEngine('device');
+      setVoiceTab('device');
+      setError(`${v.provider === 'eleven' ? 'ElevenLabs' : 'Google'} narration is not available. Switched to a device voice.`);
+      return;
+    }
+    setCloudVoice(v);
+    setEngine('cloud');
+    if (isPlaying) playFrom(chunkIndex, { cloudVoice: v, cloud: true });
+    else audition(v);
+  };
+
+  const pickDeviceVoice = (v: DeviceVoice) => {
+    setDeviceVoice(v);
+    setEngine('device');
+    if (isPlaying) {
+      playFrom(chunkIndex, { deviceVoice: v, cloud: false });
+    } else {
+      stopAll();
+      setError(null);
+      try {
+        Speech.speak('Hello, I will be your narrator.', {
+          voice: v.identifier,
+          rate: speechRate,
+          onError: (speechError) => setError(speechError.message || `Could not use ${v.label}.`),
+        });
+      } catch (speechError) {
+        setError(speechError instanceof Error ? speechError.message : `Could not use ${v.label}.`);
+      }
+    }
+  };
+
+  // -------------------------------------------------------------------------
+  // LIBRARY / TEXT
+  // -------------------------------------------------------------------------
+  const openText = (t: string, ttl: string, auth: string) => {
+    pause();
+    setDocumentText(cleanDocumentText(t));
+    setTitle(ttl);
+    setAuthor(auth);
+    bookIntroPendingRef.current = true;
+    setChunkIndex(0);
+    updateListeningPosition(0);
+    setBookmarkOffset(null);
+    setWordRange({ start: 0, length: 0 });
+    setScreen('listen');
+    setViewMode('player');
+  };
+
+  const onImportBook = (book: BookResult, text: string) => {
+    setShelf((s) => (s.some((i) => i.book.id === book.id) ? s : [{ book, text }, ...s]));
+  };
+
+  const onOpenShelf = (item: ShelfItem) => openText(item.text, item.book.title, item.book.author);
+
+  const loadCustomText = () => {
+    if (customInput.trim()) {
+      openText(customInput, 'Custom note', 'Pasted text');
+      setCustomInput('');
+    }
+    setIsEditModalOpen(false);
+  };
+
+  // -------------------------------------------------------------------------
+  // RENDER
+  // -------------------------------------------------------------------------
+  const logoSize = Math.min(width * 0.52, Dimensions.get('window').height * 0.23, 230);
+
+  const renderReader = () => {
+    if (!currentChunk || (!isPlaying && chunkIndex === 0)) {
+      return <Text style={[styles.readerParagraph, { color: C.text }]}>{documentText}</Text>;
+    }
+    const before = documentText.slice(0, currentChunk.start);
+    const sentence = documentText.slice(currentChunk.start, currentChunk.end);
+    const after = documentText.slice(currentChunk.end);
+    const wStart = wordRange.start - currentChunk.start;
+    const hasWord = wordRange.length > 0 && wStart >= 0 && wStart < sentence.length;
+    return (
+      <Text style={styles.readerParagraph}>
+        <Text style={styles.readWords}>{before}</Text>
+        {hasWord ? (
+          <Text style={styles.activeSentence}>
+            {sentence.slice(0, wStart)}
+            <Text style={styles.activeWord}>{sentence.slice(wStart, wStart + wordRange.length)}</Text>
+            {sentence.slice(wStart + wordRange.length)}
+          </Text>
+        ) : (
+          <Text style={styles.activeSentence}>{sentence}</Text>
+        )}
+        <Text style={styles.unreadWords}>{after}</Text>
+      </Text>
+    );
+  };
+
+  const playBtnIcon = isBuffering ? null : isPlaying ? 'pause' : 'play';
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <StatusBar barStyle="light-content" />
+
+      {/* TOP BAR */}
+      <View style={styles.topNav}>
+        <TouchableOpacity style={styles.roundBtn} onPress={() => setIsEditModalOpen(true)}>
+          <Icon name="clipboard-outline" size={19} color={C.cyan} />
+        </TouchableOpacity>
+
+        <View style={styles.headerInfo}>
+          <Image source={require('./EchoReaderLogo.jpeg')} style={styles.headerLogo} />
+          <View style={{ marginLeft: 10, flexShrink: 1 }}>
+            <Text style={styles.headerBrand}>EchoReader</Text>
+            <Text style={styles.headerBookTitle} numberOfLines={1}>{title}</Text>
+          </View>
+        </View>
+
+        {screen === 'listen' ? (
+          <TouchableOpacity
+            style={[styles.modeToggle, viewMode === 'reader' && styles.modeToggleActive]}
+            onPress={() => setViewMode(viewMode === 'player' ? 'reader' : 'player')}
+          >
+            <Icon name={viewMode === 'player' ? 'book-outline' : 'disc-outline'} size={16} color={viewMode === 'reader' ? '#fff' : C.cyan} />
+            <Text style={[styles.modeToggleText, viewMode === 'reader' && { color: '#fff' }]}>
+              {viewMode === 'player' ? 'Read' : 'Listen'}
+            </Text>
+          </TouchableOpacity>
+        ) : null}
+        <TouchableOpacity
+          style={styles.roundBtn}
+          onPress={() => setIsExitConfirmOpen(true)}
+          accessibilityRole="button"
+          accessibilityLabel="Sign out"
+          accessibilityState={{ busy: isSigningOut }}
+          disabled={isSigningOut}
+        >
+          <Icon name="log-out-outline" size={19} color={C.cyan} />
+        </TouchableOpacity>
+      </View>
+      {!!accountNotice && (
+        <Text style={styles.accountNotice} accessibilityLiveRegion="polite">{accountNotice}</Text>
+      )}
+
+      {/* BODY */}
+      {screen === 'account' ? (
+          <AccountScreen
+            displayName={accountName}
+            email={account?.email || ''}
+            profilePhotoUri={profilePhotoUri}
+            onProfilePhotoChange={setProfilePhotoUri}
+            onUpdateName={saveAccountName}
+            books={shelf}
+            onOpenBook={onOpenShelf}
+            onAddBooks={() => setScreen('library')}
+          />
+      ) : screen === 'library' ? (
+        <LibraryScreen shelf={shelf} onImport={onImportBook} onOpen={onOpenShelf} />
+      ) : viewMode === 'player' ? (
+        <View style={styles.playerContainer}>
+          <View style={styles.heroWrap}>
+            <Animated.View
+              pointerEvents="none"
+              style={[styles.pulseRing, {
+                width: logoSize, height: logoSize, borderRadius: logoSize / 2,
+                opacity: ringPulse.interpolate({ inputRange: [0, 1], outputRange: [0.55, 0] }),
+                transform: [{ scale: ringPulse.interpolate({ inputRange: [0, 1], outputRange: [1, 1.28] }) }],
+              }]}
+            />
+            <View style={[styles.logoGlow, { width: logoSize, height: logoSize, borderRadius: logoSize / 2 }]}>
+              <Image
+                source={require('./EchoReaderLogo.jpeg')}
+                style={{ width: logoSize, height: logoSize, borderRadius: logoSize / 2 }}
+              />
+            </View>
+          </View>
+
+          <View style={styles.bookInfo}>
+            <Text style={styles.bookTitle} numberOfLines={2}>{title}</Text>
+            <Text style={styles.bookAuthor} numberOfLines={1}>{author}</Text>
+          </View>
+
+          <TouchableOpacity style={styles.voiceSelectorBtn} accessibilityRole="button" accessibilityLabel={`Choose narrator. Current voice: ${voiceName}`} onPress={() => {
+            setVoiceTab(useCloud ? 'cloud' : 'device');
+            setIsVoiceModalOpen(true);
+          }} activeOpacity={0.8}>
+            <Icon name={useCloud ? 'sparkles' : 'phone-portrait-outline'} size={15} color={C.magenta} />
+            <Text style={styles.voiceSelectorText} numberOfLines={1}>
+              Narrator: <Text style={styles.voiceSelectorName}>{voiceName}</Text>
+            </Text>
+            <Icon name="chevron-forward" size={16} color={C.textMuted} />
+          </TouchableOpacity>
+
+          <View style={styles.waveformContainer}>
+            {bars.map((anim, i) => (
+              <Animated.View key={i} style={[styles.waveBar, { height: anim, backgroundColor: WAVE_COLORS[i] }]} />
+            ))}
+          </View>
+
+          <View>
+            <TouchableWithoutFeedback onPress={(e) => seekToFraction(e.nativeEvent.locationX / trackWidth)}>
+              <View style={styles.trackHitArea} onLayout={(e: LayoutChangeEvent) => setTrackWidth(e.nativeEvent.layout.width || 1)}>
+                <View style={styles.trackBackground}>
+                  <View style={[styles.trackFill, { width: `${progressPercent}%` }]} />
+                </View>
+                <View style={[styles.trackThumb, { left: `${progressPercent}%` }]} />
+              </View>
+            </TouchableWithoutFeedback>
+            <View style={styles.timeRow}>
+              <Text style={styles.timeLabel}>{isBuffering ? 'Preparing voice…' : `${Math.floor(progressPercent)}% listened · ~${elapsedMinutes} min`}</Text>
+              <Text style={styles.timeLabel}>~{totalMinutes} min total</Text>
+            </View>
+            <View style={styles.bookmarkRow}>
+              <TouchableOpacity accessibilityRole="button" accessibilityLabel="Save bookmark" onPress={addBookmark} style={styles.bookmarkButton}>
+                <Icon name="bookmark-outline" size={16} color={C.cyan} />
+                <Text style={styles.bookmarkText}>Save bookmark</Text>
+              </TouchableOpacity>
+              {bookmarkOffset !== null && (
+                <TouchableOpacity accessibilityRole="button" accessibilityLabel="Go to saved bookmark" onPress={() => jumpToOffset(bookmarkOffset)} style={styles.bookmarkButton}>
+                  <Text style={styles.bookmarkText}>Go to bookmark</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+            {error && <Text style={styles.errorText} numberOfLines={3}>{error}</Text>}
+          </View>
+
+          <View style={styles.speedRow}>
+            {SPEEDS.map((r) => (
+              <TouchableOpacity key={r} accessibilityRole="button" accessibilityLabel={`Set narration speed to ${r}x`} accessibilityState={{ selected: speechRate === r }} style={[styles.speedChip, speechRate === r && styles.speedChipActive]} onPress={() => handleSpeedChange(r)}>
+                <Text style={[styles.speedChipText, speechRate === r && { color: '#fff' }]}>{r}x</Text>
+              </TouchableOpacity>
+            ))}
+          </View>
+
+          <View style={styles.mainControls}>
+            <TouchableOpacity style={styles.skipBtn} onPress={() => skipSeconds(-15)}>
+              <Icon mci name="rewind-15" size={38} color={C.textDim} />
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.largePlayBtn} accessibilityRole="button" accessibilityLabel={isPlaying ? 'Pause narration' : 'Play narration'} onPress={togglePlayPause} activeOpacity={0.85}>
+              {playBtnIcon ? (
+                <Icon name={playBtnIcon} size={36} color="#fff" style={{ marginLeft: isPlaying ? 0 : 4 }} />
+              ) : (
+                <ActivityIndicator color="#fff" size="large" />
+              )}
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.skipBtn} onPress={() => skipSeconds(15)}>
+              <Icon mci name="fast-forward-15" size={38} color={C.textDim} />
+            </TouchableOpacity>
+          </View>
+        </View>
+      ) : (
+        <View style={{ flex: 1 }}>
+          <ScrollView contentContainerStyle={styles.readerScroll} showsVerticalScrollIndicator={false}>
+            {renderReader()}
+          </ScrollView>
+          <View style={styles.miniPlayerBar}>
+            <TouchableOpacity style={styles.miniPlayBtn} accessibilityRole="button" accessibilityLabel={isPlaying ? 'Pause narration' : 'Play narration'} onPress={togglePlayPause}>
+              {playBtnIcon ? <Icon name={playBtnIcon} size={22} color="#fff" style={{ marginLeft: isPlaying ? 0 : 2 }} /> : <ActivityIndicator color="#fff" />}
+            </TouchableOpacity>
+            <View style={{ flex: 1, marginLeft: 14 }}>
+              <Text style={styles.miniTitle} numberOfLines={1}>{title}</Text>
+              <Text style={styles.miniSubtitle} numberOfLines={1}>
+                {isBuffering ? 'Preparing voice…' : isPlaying ? 'Reading aloud' : 'Paused'} · {speechRate}x · {voiceName}
+              </Text>
+            </View>
+            <TouchableOpacity style={{ padding: 6 }} onPress={() => skipSeconds(15)}>
+              <Icon mci name="fast-forward-15" size={28} color={C.textDim} />
+            </TouchableOpacity>
+          </View>
+        </View>
+      )}
+
+      {/* BOTTOM TABS */}
+      <View style={styles.tabBar}>
+        {([
+          ['listen', 'Listen', 'headset'],
+          ['library', 'Library', 'library'],
+          ['account', 'Account', 'person'],
+        ] as const).map(([key, label, icon]) => {
+          const active = screen === key;
+          return (
+            <TouchableOpacity key={key} style={styles.tabItem} onPress={() => setScreen(key)}>
+              <Icon name={active ? icon : `${icon}-outline`} size={22} color={active ? C.cyan : C.textMuted} />
+              <Text style={[styles.tabLabel, active && { color: C.cyan }]}>{label}</Text>
+            </TouchableOpacity>
+          );
+        })}
+      </View>
+
+      <Modal
+        visible={isExitConfirmOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setIsExitConfirmOpen(false)}
+      >
+        <View style={styles.modalBackdrop}>
+          <View style={styles.confirmBox}>
+            <View style={styles.modalHeaderRow}>
+              <Text style={styles.modalTitle}>Sign out?</Text>
+              <TouchableOpacity
+                onPress={() => setIsExitConfirmOpen(false)}
+                style={styles.closeBtn}
+                accessibilityRole="button"
+                accessibilityLabel="Cancel"
+                disabled={isSigningOut}
+              >
+                <View style={styles.closeBtnInner} />
+                <Icon name="close" size={20} color={C.textDim} />
+              </TouchableOpacity>
+            </View>
+            <Text style={styles.confirmText}>
+Are you sure you want to sign out of your account?
+            </Text>
+            <View style={styles.confirmActions}>
+              <TouchableOpacity
+                style={styles.confirmCancelButton}
+                onPress={() => setIsExitConfirmOpen(false)}
+                disabled={isSigningOut}
+              >
+                <Text style={styles.confirmCancelText}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.confirmExitButton}
+                onPress={() => { setIsExitConfirmOpen(false); void onExit(); }}
+                disabled={isSigningOut}
+                accessibilityState={{ busy: isSigningOut }}
+              >
+                {isSigningOut
+                  ? <ActivityIndicator size="small" color="#fff" />
+                  : <Text style={styles.confirmExitText}>Sign out</Text>}
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* VOICE MODAL */}
+      <Modal visible={isVoiceModalOpen} animationType="slide" transparent onRequestClose={() => setIsVoiceModalOpen(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalBox}>
+            <View style={styles.modalHeaderRow}>
+              <Text style={styles.modalTitle}>Choose a narrator</Text>
+              <TouchableOpacity onPress={() => setIsVoiceModalOpen(false)} style={styles.closeBtn}>
+                <Icon name="close" size={20} color={C.textDim} />
+              </TouchableOpacity>
+            </View>
+
+            <View style={styles.segment}>
+              {([['cloud', 'Natural (cloud)'], ['device', 'On this device']] as const).map(([k, l]) => (
+                <TouchableOpacity key={k} style={[styles.segmentItem, voiceTab === k && styles.segmentActive]} onPress={() => setVoiceTab(k)}>
+                  <Text style={[styles.segmentText, voiceTab === k && { color: '#fff' }]}>{l}</Text>
+                </TouchableOpacity>
+              ))}
+            </View>
+
+            {voiceTab === 'cloud' ? (
+              <>
+                <View style={styles.segment}>
+                  {([['eleven', 'ElevenLabs'], ['google', 'Google']] as const).map(([k, l]) => (
+                    <TouchableOpacity key={k} style={[styles.segmentItem, cloudTab === k && styles.segmentActive]} onPress={() => setCloudTab(k)}>
+                      <Text style={[styles.segmentText, cloudTab === k && { color: '#fff' }]}>{l}</Text>
+                    </TouchableOpacity>
+                  ))}
+                </View>
+
+                {cloudStatusLoading && <ActivityIndicator color={C.cyan} style={{ marginVertical: 20 }} />}
+
+                {!providerAvailability[cloudTab] && !cloudStatusLoading && (
+                  <View style={styles.tipCard}>
+                    <Text style={styles.tipTitle}>Cloud voice unavailable</Text>
+                    <Text style={styles.tipText}>
+                      {cloudStatusError || `${cloudTab === 'eleven' ? 'ElevenLabs' : 'Google'} narration is not configured on the secure backend. Device voices remain available.`}
+                    </Text>
+                  </View>
+                )}
+
+                {providerAvailability[cloudTab] && ((cloudTab === 'eleven' && elevenLoading) || (cloudTab === 'google' && googleLoading)) && (
+                  <ActivityIndicator color={C.cyan} style={{ marginVertical: 20 }} />
+                )}
+
+                {providerAvailability[cloudTab] && !(cloudTab === 'eleven' ? elevenLoading : googleLoading) ? (
+                  <FlatList
+                    data={cloudTab === 'eleven' ? elevenVoices : googleVoices}
+                    keyExtractor={(v) => v.provider + v.id}
+                    showsVerticalScrollIndicator={false}
+                    renderItem={({ item }) => {
+                      const sel = useCloud && item.id === cloudVoice.id && item.provider === cloudVoice.provider;
+                      return (
+                        <TouchableOpacity style={[styles.voiceItem, sel && styles.voiceItemActive]} onPress={() => pickCloudVoice(item)} activeOpacity={0.8}>
+                          <View style={[styles.voiceAvatar, sel && { backgroundColor: C.purple }]}>
+                            <Icon name={item.gender === 'Female' ? 'woman-outline' : item.gender === 'Male' ? 'man-outline' : 'mic-outline'} size={20} color={sel ? '#fff' : C.textMuted} />
+                          </View>
+                          <View style={{ flex: 1, marginLeft: 12 }}>
+                            <Text style={[styles.voiceName, sel && { color: C.cyan }]} numberOfLines={1}>{item.label}</Text>
+                            <Text style={styles.voiceMeta} numberOfLines={1}>{item.gender} · {langLabel(item.lang)}</Text>
+                          </View>
+                          <View style={[styles.tierBadge, { borderColor: tierColor(item.tier) }]}>
+                            <Text style={[styles.tierText, { color: tierColor(item.tier) }]}>{item.tier}</Text>
+                          </View>
+                          {sel && <Icon name="checkmark-circle" size={20} color={C.cyan} style={{ marginLeft: 8 }} />}
+                        </TouchableOpacity>
+                      );
+                    }}
+                    ListEmptyComponent={
+                      <Text style={styles.emptyText}>
+                        {(cloudTab === 'eleven' ? elevenVoiceError : googleVoiceError) || 'No cloud voices found.'}
+                      </Text>
+                    }
+                  />
+                ) : null}
+              </>
+            ) : (
+              <FlatList
+                data={deviceVoices}
+                keyExtractor={(v) => v.identifier}
+                showsVerticalScrollIndicator={false}
+                renderItem={({ item }) => {
+                  const sel = !useCloud && item.identifier === deviceVoice?.identifier;
+                  return (
+                    <TouchableOpacity style={[styles.voiceItem, sel && styles.voiceItemActive]} onPress={() => pickDeviceVoice(item)} activeOpacity={0.8}>
+                      <View style={[styles.voiceAvatar, sel && { backgroundColor: C.purple }]}>
+                        <Icon name="mic-outline" size={20} color={sel ? '#fff' : C.textMuted} />
+                      </View>
+                      <View style={{ flex: 1, marginLeft: 12 }}>
+                        <Text style={[styles.voiceName, sel && { color: C.cyan }]} numberOfLines={1}>{item.label}</Text>
+                        <Text style={styles.voiceMeta}>{langLabel(item.language)}</Text>
+                      </View>
+                      <View style={[styles.tierBadge, { borderColor: tierColor(item.tier) }]}>
+                        <Text style={[styles.tierText, { color: tierColor(item.tier) }]}>{item.tier}</Text>
+                      </View>
+                      {sel && <Icon name="checkmark-circle" size={20} color={C.cyan} style={{ marginLeft: 8 }} />}
+                    </TouchableOpacity>
+                  );
+                }}
+                ListEmptyComponent={
+                  <View>
+                    {deviceVoicesLoading && <ActivityIndicator color={C.cyan} style={{ marginVertical: 20 }} />}
+                    {!deviceVoicesLoading && !!deviceVoiceError && <Text style={styles.emptyText}>{deviceVoiceError}</Text>}
+                    {!deviceVoicesLoading && !deviceVoiceError && <Text style={styles.emptyText}>No extra voices found. EchoReader will use the system default.</Text>}
+                  </View>
+                }
+              />
+            )}
+          </View>
+        </View>
+      </Modal>
+
+      {/* PASTE MODAL */}
+      <Modal visible={isEditModalOpen} animationType="slide" transparent onRequestClose={() => setIsEditModalOpen(false)}>
+        <View style={styles.modalBackdrop}>
+          <View style={styles.modalBox}>
+            <Text style={[styles.modalTitle, { marginBottom: 14 }]}>Paste text to listen to</Text>
+            <TextInput
+              style={styles.modalTextInput}
+              multiline
+              placeholder="Paste an article, notes, or chapter text here…"
+              placeholderTextColor={C.textMuted}
+              value={customInput}
+              onChangeText={setCustomInput}
+            />
+            <View style={styles.modalBtnRow}>
+              <TouchableOpacity style={styles.modalCancelBtn} onPress={() => setIsEditModalOpen(false)}>
+                <Text style={{ color: C.textDim, fontWeight: '700' }}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity style={styles.modalSaveBtn} onPress={loadCustomText}>
+                <Text style={{ color: '#fff', fontWeight: '700' }}>Load text</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
+      </Modal>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  safeArea: { flex: 1, backgroundColor: C.bg },
+  accountNotice: { color: C.text, backgroundColor: C.surface, padding: 12 },
+
+  topNav: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between',
+    paddingHorizontal: 16, paddingVertical: 10, borderBottomWidth: 1, borderBottomColor: C.border, gap: 8,
+  },
+  roundBtn: {
+    width: 38, height: 38, borderRadius: 19, backgroundColor: C.surface,
+    borderWidth: 1, borderColor: C.border, alignItems: 'center', justifyContent: 'center',
+  },
+  headerInfo: { flex: 1, flexDirection: 'row', alignItems: 'center', minWidth: 0 },
+  headerLogo: { width: 34, height: 34, borderRadius: 17 },
+  headerBrand: { color: C.text, fontSize: 15, fontWeight: '800', letterSpacing: 0.3 },
+  headerBookTitle: { color: C.textMuted, fontSize: 11, fontWeight: '600', marginTop: 1 },
+  modeToggle: {
+    flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 12, paddingVertical: 8,
+    borderRadius: 20, backgroundColor: C.surface, borderWidth: 1, borderColor: C.border,
+  },
+  modeToggleActive: { backgroundColor: C.purple, borderColor: C.magenta },
+  modeToggleText: { color: C.cyan, fontSize: 12, fontWeight: '700' },
+
+  playerContainer: { flex: 1, paddingHorizontal: 26, justifyContent: 'space-between', paddingTop: 14, paddingBottom: 10 },
+  heroWrap: { alignItems: 'center', justifyContent: 'center' },
+  pulseRing: { position: 'absolute', borderWidth: 2, borderColor: C.cyan },
+  logoGlow: {
+    shadowColor: C.purple, shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.9, shadowRadius: 28,
+    elevation: 24, backgroundColor: C.bg,
+  },
+  bookInfo: { alignItems: 'center' },
+  bookTitle: { color: C.text, fontSize: 21, fontWeight: '800', textAlign: 'center' },
+  bookAuthor: { color: C.textMuted, fontSize: 13, fontWeight: '600', marginTop: 4 },
+
+  voiceSelectorBtn: {
+    flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: C.surface,
+    paddingVertical: 10, paddingHorizontal: 16, borderRadius: 22, alignSelf: 'center', maxWidth: '100%',
+    borderWidth: 1, borderColor: C.border,
+  },
+  voiceSelectorText: { color: C.textDim, fontSize: 13, fontWeight: '600', flexShrink: 1 },
+  voiceSelectorName: { color: C.text, fontWeight: '800' },
+
+  waveformContainer: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 7, height: 58 },
+  waveBar: { width: 6, borderRadius: 3 },
+
+  trackHitArea: { height: 26, justifyContent: 'center' },
+  trackBackground: { height: 6, backgroundColor: C.surfaceAlt, borderRadius: 3, overflow: 'hidden' },
+  trackFill: { height: '100%', backgroundColor: C.purple, borderRadius: 3 },
+  trackThumb: {
+    position: 'absolute', width: 16, height: 16, borderRadius: 8, marginLeft: -8, backgroundColor: C.cyan,
+    shadowColor: C.cyan, shadowOpacity: 0.9, shadowRadius: 8, shadowOffset: { width: 0, height: 0 }, elevation: 6,
+  },
+  timeRow: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 4 },
+  timeLabel: { color: C.textMuted, fontSize: 12, fontWeight: '600' },
+  errorText: { color: C.danger, fontSize: 12, marginTop: 6, textAlign: 'center' },
+  bookmarkRow: { flexDirection: 'row', justifyContent: 'center', gap: 14, marginTop: 8 },
+  bookmarkButton: { flexDirection: 'row', alignItems: 'center', gap: 5, paddingVertical: 7 },
+  bookmarkText: { color: C.cyan, fontSize: 12, fontWeight: '700' },
+
+  speedRow: { flexDirection: 'row', justifyContent: 'center', gap: 10 },
+  speedChip: { paddingHorizontal: 13, paddingVertical: 6, borderRadius: 14, backgroundColor: C.surface, borderWidth: 1, borderColor: C.border },
+  speedChipActive: { backgroundColor: C.purple, borderColor: C.magenta },
+  speedChipText: { color: C.textMuted, fontSize: 12, fontWeight: '700' },
+
+  mainControls: { flexDirection: 'row', justifyContent: 'center', alignItems: 'center', gap: 34 },
+  skipBtn: { padding: 8 },
+  largePlayBtn: {
+    width: 78, height: 78, borderRadius: 39, backgroundColor: C.purple, borderWidth: 2, borderColor: C.magenta,
+    justifyContent: 'center', alignItems: 'center', shadowColor: C.magenta, shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 0.8, shadowRadius: 20, elevation: 14,
+  },
+
+  readerScroll: { padding: 24, paddingBottom: 120 },
+  readerParagraph: { fontSize: 20, lineHeight: 34, fontFamily: Platform.OS === 'ios' ? 'Georgia' : 'serif' },
+  readWords: { color: C.textMuted },
+  activeSentence: { color: C.text, backgroundColor: 'rgba(155, 92, 255, 0.22)' },
+  activeWord: { backgroundColor: C.cyan, color: '#000', fontWeight: '800' },
+  unreadWords: { color: C.textDim },
+  miniPlayerBar: {
+    position: 'absolute', bottom: 12, left: 16, right: 16, backgroundColor: C.surface, borderRadius: 22,
+    flexDirection: 'row', alignItems: 'center', padding: 12, borderWidth: 1, borderColor: C.border,
+    shadowColor: C.purple, shadowOpacity: 0.5, shadowRadius: 16, shadowOffset: { width: 0, height: 0 }, elevation: 12,
+  },
+  miniPlayBtn: { width: 44, height: 44, borderRadius: 22, backgroundColor: C.purple, justifyContent: 'center', alignItems: 'center' },
+  miniTitle: { color: C.text, fontWeight: '700', fontSize: 14 },
+  miniSubtitle: { color: C.textMuted, fontSize: 12, marginTop: 2 },
+
+  tabBar: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: C.border, backgroundColor: C.bg, paddingVertical: 8 },
+  tabItem: { flex: 1, alignItems: 'center', gap: 2 },
+  tabLabel: { color: C.textMuted, fontSize: 11, fontWeight: '700' },
+
+  modalBackdrop: { flex: 1, backgroundColor: 'rgba(0,0,0,0.88)', justifyContent: 'center', padding: 20 },
+  modalBox: { backgroundColor: C.surface, borderRadius: 26, padding: 20, maxHeight: '86%', borderWidth: 1, borderColor: C.border },
+  confirmBox: { backgroundColor: C.surface, borderRadius: 22, padding: 20, borderWidth: 1, borderColor: C.border },
+  confirmText: { color: C.textDim, fontSize: 14, lineHeight: 21, marginBottom: 20 },
+  confirmActions: { flexDirection: 'row', justifyContent: 'flex-end', alignItems: 'center', gap: 10 },
+  confirmCancelButton: { minHeight: 42, justifyContent: 'center', paddingHorizontal: 14, borderRadius: 12, backgroundColor: C.surfaceAlt },
+  confirmCancelText: { color: C.textDim, fontSize: 13, fontWeight: '700' },
+  confirmExitButton: { minHeight: 42, minWidth: 92, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 14, borderRadius: 12, backgroundColor: C.purple },
+  confirmExitText: { color: '#fff', fontSize: 13, fontWeight: '800' },
+  modalHeaderRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 14 },
+  modalTitle: { color: C.text, fontSize: 19, fontWeight: '800' },
+  closeBtn: { width: 34, height: 34, borderRadius: 17, backgroundColor: C.surfaceAlt, alignItems: 'center', justifyContent: 'center' },
+
+  segment: { flexDirection: 'row', backgroundColor: C.bg, borderRadius: 12, padding: 3, marginBottom: 12, borderWidth: 1, borderColor: C.border },
+  segmentItem: { flex: 1, paddingVertical: 8, borderRadius: 9, alignItems: 'center' },
+  segmentActive: { backgroundColor: C.purple },
+  segmentText: { color: C.textMuted, fontSize: 12, fontWeight: '700' },
+
+  tipCard: { backgroundColor: C.surfaceAlt, borderRadius: 14, padding: 14, marginBottom: 12, borderLeftWidth: 3, borderLeftColor: C.cyan },
+  tipTitle: { color: C.text, fontSize: 14, fontWeight: '800', marginBottom: 4 },
+  tipText: { color: C.textDim, fontSize: 12, lineHeight: 18 },
+
+  voiceItem: {
+    flexDirection: 'row', alignItems: 'center', padding: 12, borderRadius: 16, backgroundColor: C.bg,
+    marginBottom: 10, borderWidth: 1, borderColor: C.border,
+  },
+  voiceItemActive: { borderColor: C.magenta, backgroundColor: C.surfaceAlt },
+  voiceAvatar: { width: 38, height: 38, borderRadius: 19, backgroundColor: C.surfaceAlt, alignItems: 'center', justifyContent: 'center' },
+  voiceName: { color: C.text, fontSize: 15, fontWeight: '700' },
+  voiceMeta: { color: C.textMuted, fontSize: 12, marginTop: 2 },
+  tierBadge: { borderWidth: 1, borderRadius: 10, paddingHorizontal: 8, paddingVertical: 2 },
+  tierText: { fontSize: 10, fontWeight: '800' },
+  emptyText: { color: C.textMuted, textAlign: 'center', marginVertical: 20 },
+
+  modalTextInput: {
+    backgroundColor: C.bg, borderRadius: 14, padding: 16, color: C.text, fontSize: 15, height: 200,
+    textAlignVertical: 'top', borderWidth: 1, borderColor: C.border,
+  },
+  modalBtnRow: { flexDirection: 'row', justifyContent: 'flex-end', gap: 12, marginTop: 16 },
+  modalCancelBtn: { paddingVertical: 11, paddingHorizontal: 18, borderRadius: 12, backgroundColor: C.surfaceAlt },
+  modalSaveBtn: { paddingVertical: 11, paddingHorizontal: 22, borderRadius: 12, backgroundColor: C.purple },
+  modalBtnText: { color: C.text, fontSize: 15, fontWeight: '700' },
+  modalBtnTextCancel: { color: C.textDim, fontSize: 15, fontWeight: '700' },
+
+  icon: { width: 24, height: 24, borderRadius: 12, backgroundColor: C.surfaceAlt, alignItems: 'center', justifyContent: 'center' },
+
+  closeBtnInner: {
+    position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, borderRadius: 17,
+    borderWidth: 1, borderColor: C.border,
+  },
+  
+});

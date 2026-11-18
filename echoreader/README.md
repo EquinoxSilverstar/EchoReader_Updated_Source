@@ -14,32 +14,11 @@ See **[START_HERE.md](START_HERE.md)** for setup, limitations and the current re
 
 The library is for your own books. Import EPUB, TXT, or Markdown (`.md`) files from your device, then open a book from your shelf to listen or read it. Imported books and reading position remain in memory for the current session.
 
-Device narration uses the voices installed on the user's device or browser; the reader now requires a signed-in account. Device voices do not require paid TTS provider credentials. ElevenLabs and Google narration use the authenticated Firebase Functions backend; their API keys are never placed in the web or native client. Configure `EXPO_PUBLIC_TTS_PROXY_URL` with the deployed function URL to enable cloud voices.
+Device narration uses the voices installed on the user's device or browser; the reader now requires a signed-in account. Device voices do not require paid TTS provider credentials. ElevenLabs and Google narration use an authenticated Cloudflare Worker. Set `EXPO_PUBLIC_TTS_PROXY_URL` to its public HTTPS URL to enable cloud voices.
 
 ### Optional cloud narration backend
 
-The backend is prepared in `functions/` but is not deployed or enabled by this project. Cloud Functions and Firestore usage may incur charges and require a Firebase billing plan. Review pricing and explicitly approve enabling those services before deployment.
-
-1. In Firebase, enable Cloud Functions and Firestore for the existing Firebase project. Cloud Functions deployment may require the Blaze plan. Enable the Google Cloud Text-to-Speech API only if you intend to use Google voices.
-2. From the project root, install the Functions dependencies with `npm --prefix functions install`.
-3. Store provider credentials in the Firebase Secret Manager JSON secret; do not put them in `Api.env`, `.env.local`, GitHub variables, or any `EXPO_PUBLIC_*` setting. The CLI prompts for the value; include only providers you intend to use (or `{}` to deploy with cloud voices disabled):
-
-   ```sh
-   firebase functions:secrets:set TTS_PROVIDER_KEYS
-   ```
-
-   The JSON object may contain `eleven` and/or `google`, each with its provider API key. Restrict a Google API key to Cloud Text-to-Speech.
-4. Ensure Firestore security rules deny all client reads and writes to `/ttsUsage/{userId}`. The Functions Admin SDK uses this collection for server-side rate and daily usage limits; normal client SDK access is not required.
-5. Restrict HTTP origins in `functions/src/tts-core.js` to the exact production Pages origin and any local development origins you use. Native requests omit `Origin`; browser requests are checked against this allowlist.
-6. After reviewing cost controls and provider billing, deploy only when approved:
-
-   ```sh
-   firebase deploy --only functions:ttsGateway
-   ```
-
-7. Copy the resulting HTTPS function URL into the GitHub Actions repository variable `EXPO_PUBLIC_TTS_PROXY_URL`. For local native development, put the URL in `Api.env`; for local web development, set it in `.env.local`. The endpoint URL is public configuration, not a secret.
-
-The backend requires a valid Firebase Authentication ID token. It limits authenticated users to 10 requests per minute, 100 requests per UTC day, and 100,000 text characters per UTC day, and caps returned audio at 8 MiB. Provider API usage can still be billable; do not configure provider secrets unless you accept those charges. When cloud service configuration or requests fail, users can continue with device narration.
+Follow [Cloudflare voice setup](cloudflare/README.md) to deploy the Worker and configure the voice providers. EchoReader continues to use Firebase Authentication on Spark. The Worker uses the existing TTS routes and keeps provider secrets server-side.
 
 Run `npm start`, `npm run android`, or `npm run ios` to start native development with values from the local `Api.env` file. Use `npm run web` for web development; it does not load `Api.env`.
 

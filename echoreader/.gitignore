@@ -43,3 +43,7 @@ Api.env
 # generated native folders
 /ios
 /android
+
+# Cloudflare Worker state and local secrets
+.wrangler/
+.dev.vars*

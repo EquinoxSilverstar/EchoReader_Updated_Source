@@ -1,6 +1,6 @@
 /**
  * EchoReader TTS module. Provider credentials stay in the authenticated
- * Firebase Functions backend; the client only receives its public endpoint.
+ * cloud narration backend; the client only receives its public endpoint.
  */
 import { Platform } from 'react-native';
 import type { Voice as ExpoVoice } from 'expo-speech';

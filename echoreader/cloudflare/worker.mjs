@@ -134,7 +134,14 @@ function asFetchResponse() {
   const headers = new Headers(BASE_HEADERS);
   return {
     status(code) { status = code; return this; },
-    set(entries) { for (const [key, value] of Object.entries(entries)) headers.set(key, value); return this; },
+    set(nameOrEntries, value) {
+      if (typeof nameOrEntries === 'string') {
+        headers.set(nameOrEntries, value);
+      } else {
+        for (const [key, entryValue] of Object.entries(nameOrEntries)) headers.set(key, entryValue);
+      }
+      return this;
+    },
     json(value) { headers.set('Content-Type', 'application/json'); return new Response(JSON.stringify(value), { status, headers }); },
     send(value) { return new Response(status === 204 ? null : value, { status, headers }); },
   };

@@ -22,6 +22,9 @@ test('Worker exposes a readiness check, rejects unauthenticated requests and enf
   assert.equal((await worker.fetch(request('/health'), {})).status, 503);
   assert.equal((await worker.fetch(request('/health'), { USAGE: {} })).status, 200);
   assert.equal((await worker.fetch(request('/status'), {})).status, 401);
+  const unauthenticated = await worker.fetch(request('/status', { origin: site }), {});
+  assert.equal(unauthenticated.status, 401);
+  assert.equal(unauthenticated.headers.get('Access-Control-Allow-Origin'), site);
   assert.equal((await worker.fetch(request('/status', { token: 'invalid.token', origin: site }), {})).status, 401);
   assert.equal((await worker.fetch(request('/status', { origin: 'https://elsewhere.example' }), {})).status, 403);
   const preflight = await worker.fetch(request('/tts', { method: 'OPTIONS', origin: site }), {});

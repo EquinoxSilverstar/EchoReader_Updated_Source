@@ -78,7 +78,7 @@ export function rankDeviceVoices(voices: ExpoVoice[]): DeviceVoice[] {
 async function authHeaders(): Promise<Record<string, string>> {
   const user = auth?.currentUser;
   if (!user) throw new Error('Sign in to use cloud narration. Device voices work without signing in.');
-  return { Authorization: `Bearer ${await user.getIdToken()}` };
+  return { Authorization: `Bearer ${await user.getIdToken(true)}` };
 }
 
 async function proxyRequest(path: string, init: RequestInit = {}): Promise<Response> {
@@ -237,6 +237,7 @@ export function playUri(
     statusSubscription = undefined;
     player?.remove();
     player = undefined;
+    
   };
 
   try {

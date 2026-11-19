@@ -2,7 +2,7 @@ name: Deploy web demo
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -17,12 +17,16 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: echoreader
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 24
           cache: npm
+          cache-dependency-path: echoreader/package-lock.json
       - run: npm ci
       - run: npm run build:web
         env:
@@ -33,7 +37,7 @@ jobs:
           EXPO_PUBLIC_TTS_PROXY_URL: ${{ vars.EXPO_PUBLIC_TTS_PROXY_URL }}
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: dist
+          path: echoreader/dist
 
   deploy:
     needs: build

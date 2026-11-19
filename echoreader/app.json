@@ -24,7 +24,7 @@
       "favicon": "./assets/favicon.png"
     },
     "experiments": {
-      "baseUrl": "/echoreader"
+      "baseUrl": "/EchoReader_Updated_Source"
     },
     "plugins": [
       [
